@@ -42,7 +42,9 @@ class FieldDef:
         elif self.type == DataType.ADDRESS:
             buf[o:o+3] = val.bytes
 
-    def format(self, val):
+    def format(self, msg=None):
+        val = msg[self.name] if msg and self.name in msg else None
+
         if val is None:
             val = self.default_value
 

@@ -51,9 +51,9 @@ class AckType(Enum):
 # Message behaves like a dictionary
 # with a associated definition
 class Msg:
-    def __init__(self, msg_def, msg={}):
+    def __init__(self, msg_def, msg=None):
         self._def = msg_def
-        self._msg = msg # The message dictionary
+        self._msg = msg if msg else {} # The message dictionary
 
     def __contains__(self, name):
         return name in self._msg

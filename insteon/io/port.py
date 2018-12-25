@@ -197,7 +197,7 @@ class Port:
                             continue
                     else:
                         l = lr
-                    l.send(msg)
+                    l(msg)
 
     def _write_thread(self):
         while self._writer:
@@ -277,7 +277,7 @@ class Port:
                                     continue
                             else:
                                 l = lr
-                            l.send(msg)
+                            l(msg)
 
                     # Remove the write channel the first time we write
                     if i == 0:

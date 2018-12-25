@@ -14,7 +14,7 @@ class DefaultRecordFormatter:
 
     def __call__(self, rec):
         off = rec['offset']
-        addr = msg.format_addr(rec['address'])
+        addr = rec['address'].human
         dev = self._registry.by_addr[rec['address']].name \
                 if self._registry and rec['address'] in self._registry.by_addr else addr
         group = rec['group']

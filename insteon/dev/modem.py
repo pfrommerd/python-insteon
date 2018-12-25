@@ -30,7 +30,7 @@ class Modem(Device):
 
         # Add the features
         from .dbmanager import ModemDBManager
-        self.add_feature('db', ModemDBManager(port))
+        self.add_feature('db', ModemDBManager(self))
 
     @contextmanager
     def bind(self): # Binds as the default conduit

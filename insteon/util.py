@@ -104,6 +104,9 @@ class Channel:
         except queue.Full:
             return # Drop...
 
+    def __call__(self, *args):
+        self.send(*args)
+
 # A custom insteon error type
 # that the terminal knows can just be printed out
 # without a stack trace

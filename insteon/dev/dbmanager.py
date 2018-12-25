@@ -1,4 +1,5 @@
 from . import linkdb
+from ..util import Channel,InsteonError
 
 class DBManager:
     def __init__(self, dev, record_formatter):
@@ -8,7 +9,7 @@ class DBManager:
     # Will update/return the target db,
     # create a new database if None
     def update_cache(self, targetdb=None, port=None):
-        port = port if port else self._dev.primary_port
+        port = port if port else self._dev.port
 
         if not targetdb:
             targetdb = self.cache
@@ -20,7 +21,7 @@ class DBManager:
         return targetdb
 
     def flash_cache(self, srcdb=None, port=None):
-        port = port if port else self._dev.primary_port
+        port = port if port else self._dev.port
 
         if not srcdb:
             srcdb = self.cache
@@ -69,10 +70,10 @@ class ModemDBManager(DBManager):
 
     def _retrieve(self, port):
         reply_channel = Channel()
-        done_channel = Channel(lambda x: (x['type'] == 'GetFirstALLLinkRecordReply' or \
-                                              x['type'] == 'GetNextALLLinkRecordReply') and \
+        done_channel = Channel(lambda x: (x.type == 'GetFirstALLLinkRecordReply' or \
+                                              x.type == 'GetNextALLLinkRecordReply') and \
                                               x['ACK/NACK'] == 0x15)
-        record_channel = Channel(lambda x: x['type'] == 'ALLLinkRecordResponse')
+        record_channel = Channel(lambda x: x.type == 'ALLLinkRecordResponse')
 
 
         # Now send the first message
