@@ -1,0 +1,11 @@
+*~
+*.pyc
+*.log
+*.nfs*
+*.linkdb*
+*.db*
+*.bk
+*.egg-info
+
+__pycache__
+init.py
