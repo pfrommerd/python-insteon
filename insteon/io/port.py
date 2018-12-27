@@ -91,11 +91,12 @@ class Port:
 
         # Start threads
         self._conn = conn
-        self._reader = threading.Thread(target=self._read_thread)
-        self._writer = threading.Thread(target=self._write_thread)
-        # Trigger for a thread to exit
-        self._reader.override_kill = lambda: detach()
-        self._writer.override_kill = lambda: detach()
+        self._reader = threading.Thread(target=self._read_thread, daemon=True)
+        self._writer = threading.Thread(target=self._write_thread, daemon=True)
+
+        # Trigger for a thread to stop
+        self._reader.stop = self.close
+        self._writer.stop = self.close
 
         self._reader.start()
         self._writer.start()
@@ -109,14 +110,14 @@ class Port:
             w = self._writer
             self._writer = None
             w.join()
+
         self._conn = None
 
     def close(self): # Detaches and closes the connection
         if self._conn:
             conn = self._conn
-            detach()
+            self.detach()
             conn.close()
-
 
     def notify_on_read(self, handler):
         if not handler:

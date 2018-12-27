@@ -15,6 +15,10 @@ class SerialConn:
                                     xonxoff=xonxoff, rtscts=rtscts,
                                     write_timeout=write_timeout, dsrdtr=dsrdtr,
                                     inter_byte_timeout=inter_byte_timeout)
+
+    def __del__(self):
+        if self.is_open:
+            self.close()
     
     @property
     def is_open(self):

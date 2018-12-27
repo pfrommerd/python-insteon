@@ -1,4 +1,5 @@
 from .device import Device
+from .network import Network
 
 from ..io.address import Address
 from ..util import Channel
@@ -32,13 +33,31 @@ class Modem(Device):
         from .dbmanager import ModemDBManager
         self.add_feature('db', ModemDBManager(self))
 
+        from .linker import ModemLinker
+        self.add_feature('linker', ModemLinker(self))
+
+    def bind(self):
+        stack = getattr(_bound_modem, 'stack', None)
+        if not stack:
+            stack = []
+            _bound_modem.stack = stack
+        stack.append(self)
+
+    def unbind(self):
+        stack = getattr(_bound_modem, 'stack', None)
+        if stack:
+            stack.remove(self)
+
     @contextmanager
-    def bind(self): # Binds as the default conduit
-        old = Modem.bound()
-        _bound_modem.modem = self
+    def use(self):
+        self.bind()
         yield
-        _bound_modem.modem = old
+        self.unbind()
 
     @staticmethod
     def bound():
-        return getattr(_bound_modem, 'modem', None)
+        stack = getattr(_bound_modem, 'stack', None)
+        if stack:
+            return stack[-1]
+        else:
+            return None
