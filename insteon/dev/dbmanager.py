@@ -34,6 +34,8 @@ class DBManager:
                 raise InsteonError('Not linked as a controller so cannot access database')
             # Get a fresh copy now that we have permissions
             records = self._retrieve(port)
+            if not self._check_permissions(records):
+                raise InsteonError('Failed to get permission to modify the database')
 
         targetdb.update(records)
 
@@ -65,10 +67,6 @@ class DBManager:
 
         logger.trace('Writing linkdb changes')
         self._write(port, srcdb, currentdb)
-
-        logger.trace('Updating linkdb cache')
-        self.update_cache(port=port)
-
 
     # Checks if the db has the permissions for
     # us to read
@@ -108,7 +106,7 @@ class GenericDBManager(DBManager):
 
         # Check if the modem is in the currentdb
         # to see if we have the permissions to flash the database
-        rec_filter = LinkRecord(address=modem_addr, filter_flags_mask=(1 << 6))
+        rec_filter = LinkRecord(address=modem_addr, flags_mask=(1 << 6))
         if rec_filter in currentdb:
             return True
         return False
@@ -158,67 +156,132 @@ class GenericDBManager(DBManager):
 
         return db
 
+    def _write_entry(self, offset, record):
+        record = record.copy()
+        record.offset = None
+        logger.debug('Writing record to {:04x}: {}'.format(offset, record))
+        req_data = [0x00, 0x02]
+        req_data.append((offset >> 8) & 0xFF)
+        req_data.append(offset & 0xFF)
+        req_data.append(8) # Set 8 bytes
+
+        record_bytes = record.bytes
+        # Make sure if nothing else that the high water
+        # bit is set. If it isn't we could really brick the device
+        record_bytes[0] = record_bytes[0] | 0x10
+        req_data.extend(record_bytes)
+        self._dev.querier.query_ext(0x2f, 0x00, req_data)
+        time.sleep(1)
+
+    def _null_entry(self, offset):
+        logger.debug('Setting database end at {:04x}'.format(offset))
+        req_data = [0x00, 0x02]
+        req_data.append((offset >> 8) & 0xFF)
+        req_data.append(offset & 0xFF)
+        req_data.append(8) # Set 8 bytes
+        req_data.extend(8*[0x00]) # null out the entry
+        self._dev.querier.query_ext(0x2f, 0x00, req_data)
+        time.sleep(1)
+
     def _write(self, port, srcdb, currentdb):
-        querier = self._dev.querier
         # When nuking a database unlink the modem last
         modem_addr = self._dev.modem.address
-        free_offset = currentdb.end_offset
 
-        def remove(record):
-            logger.debug('Deleting record {}'.format(record))
-            req_data = [0x00, 0x02]
-            req_data.append((record.offset >> 8) & 0xFF)
-            req_data.append(record.offset & 0xFF)
-            req_data.append(8) # Set 8 bytes
-            req_data.extend(8*[0x00]) # null out the entry
-            querier.query_ext(0x2f, 0x00, req_data)
-            time.sleep(1)
-
-        def add(record, offset):
-            logger.debug('Adding({:04x}) record {}'.format(offset, record))
-            req_data = [0x00, 0x02]
-            req_data.append((record.offset >> 8) & 0xFF)
-            req_data.append(record.offset & 0xFF)
-            req_data.append(8) # Set 8 bytes
-
-            req_data.append(record.flags)
-            req_data.append(record.group)
-            req_data.extend(record.address.array)
-            req_data.extend(record.data[0:3])
-            querier.query_ext(0x2f, 0x00, req_data)
-            time.sleep(1)
-
-        last_remove = None
+        delete_records = []
         for record in currentdb:
             if not record.active:
                 continue
             filter_rec = record.copy()
             filter_rec.offset = None # We don't care about offset
-            if not filter_rec in srcdb:
-                # Don't delete the modem record, we need that
-                if record.address == modem_addr and record.responder and not last_remove:
-                    last_remove = record
-                    continue
-                remove(record)
+            if any(map(lambda x: x.offset < record.offset and filter_rec.matches(x), currentdb)):
+                logger.debug('Found dup  record: {}'.format(record))
+                delete_records.append(record)
+            elif not filter_rec in srcdb:
+                logger.debug('Found del  record: {}'.format(record))
+                delete_records.append(record)
+
+
+        free_records = list(delete_records)
+        for record in currentdb:
+            if not record.active:
+                logger.debug('Found free record: {}'.format(record))
+                free_records.append(record)
+                if record.null:
+                    # Append a bunch of dummy records after
+                    for i in range(srcdb.size):
+                        if record.offset - (i + 1) * 0x08 > 0x08:
+                            free_records.append(LinkRecord(offset=record.offset - (i + 1)*0x08))
+
+        logger.trace('Writing new records')
+
+        # if the modem is being removed, add the modem at the first free offset temporarily
+        modem_record = LinkRecord(address=modem_addr)
+        modem_record.mask_link_type()
+        modem_record.mask_active()
+        modem_record.active = True
+        modem_record.controller = False
+        modem_record.high_water = False
+
+        modem_offset = None
+        if any(map(lambda x: modem_record.matches(x), delete_records)):
+            if len(free_records) == 0:
+                raise InsteonError('Out of database space!')
+            modem_offset = free_records.pop(0).offset
+            logger.trace('Writing modem record for editing into first free space')
+            self._write_entry(modem_offset, modem_record)
+
+        # Write any new entries into the free
+        # spaces
+        for record in srcdb:
+            if not record.active:
+                continue
+            filter_rec = record.copy()
+            filter_rec.offset = None # We don't care about offset
+            if not filter_rec in currentdb:
+                if len(free_records) == 0:
+                    raise InsteonError('Out of database space!')
+                free_offset = free_records.pop(0).offset
+                self._write_entry(free_offset, record)
 
         logger.trace('Fetching fresh copy of database')
         currentdb = linkdb.LinkDB()
         self.update_cache(targetdb=currentdb, port=port)
 
-        free_offset = currentdb.end_offset
+        logger.trace('Disabling inactive records')
 
-        # Add any other links
-        for record in srcdb:
-            filter_rec = record.copy()
-            filter_rec.offset = None # We don't care about offset
-            if not filter_rec in currentdb:
-                if free_offset < 0x08:
-                    raise InsteonError('Out of space in linkdb!')
-                add(record, free_offset)
-                free_offset -= 0x08
+        # Disable anything that shouldn't be in the database
+        for record in currentdb:
+            if not record.active:
+                continue
+            if any(map(lambda x: record.matches(x), delete_records)):
+                if modem_offset and record.offset == modem_offset:
+                    continue # We'll handle this one at the end 
+                new_record = record.copy()
+                new_record.active = False
+                self._write_entry(new_record.offset, new_record)
 
-        if last_remove:
-            remove(last_remove)
+        logger.trace('Fetching fresh copy of database')
+        currentdb = linkdb.LinkDB()
+        self.update_cache(targetdb=currentdb, port=port)
+        logger.trace('Setting end to null entry')
+
+        # Chop off after the end
+        self._null_entry(currentdb.end_offset)
+
+        if modem_offset:
+            logger.trace('Fetching fresh copy of database')
+            currentdb = linkdb.LinkDB()
+            self.update_cache(targetdb=currentdb, port=port)
+            logger.trace('Disabling modem record')
+            # If the modem is the last record, just wipe the database
+            if modem_offset == currentdb.end_offset - 0x08:
+                self._null_entry(modem_offset)
+            else:
+                new_record = currentdb.at(modem_offset).copy()
+                new_record.active = False
+                self._write_entry(new_record.offset, new_record)
+
+
 
 class ModemDBManager(DBManager):
     def __init__(self, dev):

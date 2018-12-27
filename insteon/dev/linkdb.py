@@ -13,30 +13,84 @@ from warnings import warn
 
 class LinkRecord:
     def __init__(self, offset=None, address=None, group=None, flags=None, data=None,
-                       filter_flags_mask=None, filter_link_type=False, filter_controller=False):
+                        flags_mask=None):
         self.offset = offset
         self.address = address
         self.group = group
         self.flags = flags
         self.data = data
+        self._flags_mask = flags_mask
 
-        self._filter_flags = filter_flags_mask
-        if filter_link_type and not self._filter_flags:
-            self._filter_flags =  (1 << 6)
-        if self._filter_flags and filter_controller:
-            self.flags = self.flags | (1 << 6)
+    def mask_link_type(self):
+        if not self._flags_mask:
+            self._flags_mask = 0
+        self._flags_mask |= (1 << 6)
+
+    def mask_active(self):
+        if not self._flags_mask:
+            self._flags_mask = 0
+        self._flags_mask |= (1 << 7)
+
+    @property
+    def null(self):
+        return sum(self.bytes) == 0
 
     @property
     def active(self):
+        if not self.flags:
+            return False
         return self.flags & (1 << 7) > 0
+
+    @active.setter
+    def active(self, value):
+        if not self.flags:
+            self.flags = 0
+        self.flags &= ~(1 << 7)
+        if value:
+            self.flags |= (1 << 7)
+
+    @property
+    def high_water(self):
+        if not self.flags:
+            return False
+        return self.flags & (1 << 1) == 0
+
+    @high_water.setter
+    def high_water(self, value):
+        if not self.flags:
+            self.flags = 0
+        self.flags &= ~(1 << 1)
+        if not value:
+            self.flags |= (1 << 1)
 
     @property
     def controller(self):
+        if not self.flags:
+            return False
         return self.flags & (1 << 6) > 0
+
+    @controller.setter
+    def controller(self, value):
+        if not self.flags:
+            self.flags = 0
+        self.flags &= ~(1 << 6)
+        if value:
+            self.flags |= (1 << 6)
 
     @property
     def responder(self):
         return not self.controller
+
+    @responder.setter
+    def responder(self, value):
+        self.controller = not value
+
+    @property
+    def bytes(self):
+        return [(self.flags if self.flags else 0), \
+                (self.group if self.group else 0)] + \
+                self.address.array + \
+                (self.data if self.data else [0, 0, 0])
 
     @property
     def packed(self):
@@ -75,7 +129,7 @@ class LinkRecord:
             return False
         if self.flags is not None \
                 and other.flags is not None:
-            filter_flags = self._filter_flags if self._filter_flags else other._filter_flags
+            filter_flags = self._flags_mask if self._flags_mask else other._flags_mask
             if filter_flags and self.flags & filter_flags != other.flags & filter_flags:
                 return False
             if not filter_flags and self.flags != other.flags:
@@ -87,12 +141,17 @@ class LinkRecord:
         return True
 
     def __str__(self):
-        valid = (self.flags & (1 << 7))
-        ltype = 'CTRL' if (self.flags & (1 << 6)) else 'RESP'
+        flags = self.flags if self.flags else 0
+        valid = (flags & (1 << 7))
+        ltype = 'CTRL' if (flags & (1 << 6)) else 'RESP'
         ctrl = ' ' + ltype + ' ' if valid else '(' + ltype + ')'
-        data_str = ' '.join([format(x & 0xFF, '02x') for x in self.data])
+        data_str = ' '.join([format(x & 0xFF, '02x') \
+                             for x in (self.data if self.data else [0, 0, 0])])
+        dev = self.address.human if self.address else 'xx.xx.xx'
+        addr = self.address.human if self.address else 'xx.xx.xx'
+        offset = self.offset if self.offset else 0xffff
+        group = self.group if self.group else 0
 
-        dev = self.address.human
         if network.Network.bound():
             device = network.Network.bound().get_by_address(self.address)
             if device:
@@ -100,10 +159,11 @@ class LinkRecord:
 
         if self.offset:
             return '{:04x} {:30s} {:8s} {} {:08b} group: {:02x} data: {}'.format(
-                    self.offset, dev, self.address.human, ctrl, self.flags, self.group, data_str)
+                    offset, dev, addr, ctrl, flags, group, data_str)
         else:
             return '{:30s} {:8s} {} {:08b} group: {:02x} data: {}'.format(
-                    dev, self.address.human, ctrl, self.flags, self.group, data_str)
+                    dev, addr, ctrl, flags, group, data_str)
+
 
 class LinkDB:
     def __init__(self, records=None, timestamp=None):
@@ -129,9 +189,19 @@ class LinkDB:
         return self.timestamp is not None
 
     @property
+    def size(self):
+        return len(self.records)
+
+    @property
+    def start_offset(self):
+        return 0x0fff
+
+    @property
     def end_offset(self):
         last_off = 0x0fff
         for r in self.records:
+            if not r.active:
+                continue
             if r.offset and r.offset - 0x08 < last_off:
                 last_off = r.offset - 0x08
         return last_off
@@ -143,6 +213,17 @@ class LinkDB:
     def set_invalid(self):
         self.timestamp = None
 
+    # Editing commands
+
+    def at(self, offset):
+        for r in self.records:
+            if r.offset == offset:
+                return r
+        return None
+
+    def remove(self, rec):
+        self.records.remove(rec)
+
     def add(self, rec):
         if not rec in self.records:
             self.records.append(rec)
@@ -150,7 +231,38 @@ class LinkDB:
     def clear(self):
         self.records.clear()
 
+    # For removing a particular device
+    def remove_matching(self, filter_rec):
+        for r in list(self.records):
+            if filter_rec.matches(r):
+                self.remove(r)
+
+    def remove_device(self, dev):
+        addr = dev.address
+        self.remove_matching(LinkRecord(address=addr))
+
+    def remove_address(self, address):
+        self.remove_matching(LinkRecord(address=address))
+
+    def remove_offset(self, offset):
+        self.remove_matching(LinkRecord(offset=offset))
+
+    # For adding new records
+    def add_address(self, address, controller=False, group=0x01, data=[0, 0, 0]):
+        rec = LinkRecord(address=address, group=0x01, data=data)
+        rec.active = True
+        rec.high_water = False
+        rec.controller = controller
+        self.add(rec)
+
+    def add_device(self, device, controller=False, group=0x01, data=[0, 0, 0]):
+        self.add_address(device.address, controller, group, data)
+
+    def copy(self):
+        return LinkDB([x.copy() for x in self.records], self.timestamp)
+
     # For filtering by a record
+    # will return a new database
     def filter(self, filter_rec):
         rec = []
         for r in self.records:
