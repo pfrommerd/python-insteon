@@ -10,7 +10,6 @@ from . import message
 from .. import util as util
 
 import logbook
-
 logger = logbook.Logger(__name__)
 
 class WriteRequest:
@@ -173,7 +172,7 @@ class Port:
     def _read_thread(self):
         decoder = message.MsgDecoder(self.defs)
         buf = bytes()
-        while self._reader:
+        while self._reader and self._conn.is_open:
             try:
                 buf = self._conn.read(1) # Read a byte
                 # Feed into decoder
@@ -183,8 +182,7 @@ class Port:
             except TypeError as te: # Gets thrown on close() called during read() sometimes
                 continue
             except Exception as e:
-                print('Error reading!')
-                print(traceback.format_exc())
+                logger.error(str(e))
                 continue
             
             # Notify listeners
@@ -201,7 +199,7 @@ class Port:
                     l(msg)
 
     def _write_thread(self):
-        while self._writer:
+        while self._writer and self._conn.is_open:
             try:
                 request = self._write_queue.get(timeout=0.1)
             except queue.Empty:
@@ -263,8 +261,7 @@ class Port:
                         self._conn.flush()
                     except Exception as e:
                         # TODO: Make logging
-                        print('Error writing message!')
-                        print(traceback.format_exc())
+                        logger.error(str(e))
                         break # Move on to the next message
 
                     # Notify the listeners of the write

@@ -4,6 +4,7 @@ import insteon.io.serial as serial
 
 import binascii
 import threading
+import base64
 
 def make_handler(srv):
     class HubHandler(BaseHTTPRequestHandler):
@@ -12,7 +13,25 @@ def make_handler(srv):
             self.send_header('Content-type', 'text/html')
             self.end_headers()
 
+        def do_UNAUTHORIZED(self):
+            self.send_response(401)
+            self.send_header('WWW-Authenticate', 'Basic realm=\"Test\"')
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+
         def do_GET(self):
+            if not 'Authorization' in self.headers:
+                self.do_UNAUTHORIZED()
+                self.send_text('No authentication received')
+                return
+            expected_auth = 'Basic ' + \
+                base64.b64encode((srv._username + ':' + srv._password).encode('utf-8')).decode('utf-8')
+            if self.headers['Authorization'] != expected_auth:
+                self.do_UNAUTHORIZED()
+                self.send_text('Bad authorization')
+                print('Bad authorization: {}'.format(self.headers['Authorization']))
+                return
+
             # Parse the path to either
             if self.path == '/buffstatus.xml':
                 print('Getting buffer status')
@@ -70,6 +89,8 @@ class HubServer:
         self._io_conn = io_conn
         self._port = port
         self._handler = make_handler(self)
+        self._username = username
+        self._password = password
 
         self._buffer_lock = threading.Lock()
         self._buffer = bytearray(bufferlen)
@@ -128,7 +149,7 @@ class HubServer:
 def run():
     port = 25105 
     username = 'hub'
-    password = 'hub'
+    password = 'hubpass'
     print('Server started on port {}'.format(port))
     srv = HubServer(serial.SerialConn('/dev/ttyUSB0'), port, username, password, 40)
     srv.run()
