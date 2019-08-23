@@ -7,10 +7,10 @@ class LightState:
     def __init__(self, dev):
         self._dev = dev
     
-    def set_on(self, onLevel=1, port=None):
+    async def set_on(self, onLevel=1, port=None):
         self._dev.querier.query_std(0x11, max(0, min(255, int(255*onLevel))), port=port)
 
-    def set_off(self, port=None):
+    async def set_off(self, port=None):
         self._dev.querier.query_std(0x13, 0x00, port=port)
 
 class Light(Device):

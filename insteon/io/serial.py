@@ -16,8 +16,8 @@ class SerialConn:
         self._port = None
         try:
             # Find the right serial implementation to use
-            import serial
-            self._port = serial.Serial(port=port, baudrate=baudrate,
+            import aioserial
+            self._port = aioserial.AioSerial(port=port, baudrate=baudrate,
                                         bytesize=bytesize, parity=parity,
                                         stopbits=stopbits, timeout=timeout,
                                         xonxoff=xonxoff, rtscts=rtscts,
@@ -46,25 +46,30 @@ class SerialConn:
         except:
             self._port = None
 
-    def read(self, size=1):
+    async def read(self, size=1):
         try:
             if not self.is_open:
                 return
-            return self._port.read(size)
+            return await self._port.read_async(size)
         except Exception as e:
-            self.close()
-            raise InsteonError('Error reading from serial port {}'.format(self._name))
+            raise e
+            #self.close()
+            #raise InsteonError('Error reading from serial port {}'.format(self._name))
 
-    def write(self, data):
+    async def write(self, data):
         try:
             if not self.is_open:
                 return
-            return self._port.write(data)
+            return await self._port.write_async(data)
+        except AssertionError as e:
+            self.close()
+            raise EOFError()
         except Exception as e:
             self.close()
             raise InsteonError('Error writing to serial port {}'.format(self._name))
 
-    def flush(self):
+    async def flush(self):
+        return
         try:
             if not self.is_open:
                 return

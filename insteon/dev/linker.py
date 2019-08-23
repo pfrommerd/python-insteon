@@ -1,4 +1,4 @@
-from ..util import Channel,InsteonError
+from ..util import InsteonError
 
 import logbook
 logger = logbook.Logger(__name__)

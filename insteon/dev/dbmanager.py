@@ -2,7 +2,7 @@ import datetime
 
 from .linkdb import LinkDB,LinkRecord
 from . import linkdb
-from ..util import Channel,InsteonError
+from ..util import InsteonError
 from ..io.address import Address
 
 import time

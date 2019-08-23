@@ -2,7 +2,6 @@ from .device import Device
 from .network import Network
 
 from ..io.address import Address
-from ..util import Channel
 
 import threading
 from contextlib import contextmanager
@@ -14,18 +13,9 @@ _bound_modem = threading.local()
 
 class Modem(Device):
     # Query for the address...
-    def __init__(self, name, port, net=None):
+    def __init__(self, name, addr, port, net=None):
         self._port = port
 
-        addr = Address()
-        # Query for the modem address
-        addr_query = port.defs['GetIMInfo'].create()
-
-        reply_channel = Channel()
-        port.write(addr_query, ack_reply_channel=reply_channel)
-        if reply_channel.wait(5): # Wait for a reply
-            msg = reply_channel.recv()
-            addr = msg['IMAddress']
 
         super().__init__(name, addr, net, self)
 
@@ -35,6 +25,18 @@ class Modem(Device):
 
         from .linker import ModemLinker
         self.add_feature('linker', ModemLinker(self))
+
+    @staticmethod
+    async def auto_create(name, port, net=None):
+        addr = Address()
+        # Query for the modem address
+        addr_query = port.defs['GetIMInfo'].create()
+
+        with port.write(addr_query) as req:
+            if await req.wait_success_fail('GetIMInfoReply', timeout=5):
+                addr = req.response['IMAddress']
+
+        return Modem(name, addr, port, net)
 
     def bind(self):
         stack = getattr(_bound_modem, 'stack', None)

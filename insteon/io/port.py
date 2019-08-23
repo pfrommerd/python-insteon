@@ -1,5 +1,6 @@
 import weakref
 import asyncio
+import traceback
 
 import time
 
@@ -44,6 +45,7 @@ class Request:
 
         # A list of all the responses this message has received
         self.responses = []
+        self.response = None # set on wait() for convenience so this is always the last wait
 
 
     # ------------- Lifetime Management Functions --------------
@@ -54,9 +56,9 @@ class Request:
         self.done.set()
 
     def __enter__(self):
-        pass
+        return self
 
-    def __exit__(self):
+    def __exit__(self, type, value, traceback):
         self.done.set()
 
     def success(self):
@@ -72,46 +74,79 @@ class Request:
 
     # when consume() is called a message
     # gets eaten so it won't trigger wait anymore
-    def consume(msg):
+    def consume(self, msg):
         self.responses.remove(msg)
 
     # will eat upto a particular message
-    def consume_until(msg):
+    def consume_until(self, msg):
         for i in range(len(responses)):
             if responses[i] == msg:
                 self.responses = self.responses[i + 1:]
 
+    def wait(self, timeout=0):
+        try:
+            if timeout > 0:
+                return asyncio.wait_for(self._wait(), timeout)
+            else:
+                return self._wait()
+        except asyncio.TimeoutError:
+            self.response = None
+            return None
+
+    def wait_until(self, predicate, timeout=0):
+        try:
+            if timeout > 0:
+                return asyncio.wait_for(self._wait_until(predicate), timeout)
+            else:
+                return self._wait_until(predicate)
+        except asyncio.TimeoutError:
+            self.response = None
+            return None
+
+    def wait_success_fail(self, success_type, timeout=0):
+        def handle(msg):
+            if msg.type == 'PureNACK':
+                self.failure.set()
+            if msg.type == success_type:
+                self.successful.set()
+                return True
+            return False 
+        return self.wait_until(handle, timeout)
 
     # The underlying wait functions
     # are wrapped above to have timeouts
-    async def _wait():
+    async def _wait(self):
         if len(self.responses) > 0:
             return self.responses[0]
 
-        await self.received.lock()
+        await self.received.acquire()
         try:
             await self.received.wait()
-            return self.responses[0]
+            self.response = self.responses[0]
+            return self.response
         finally:
             self.received.release()
 
-    async def _wait_util(predicate):
+    async def _wait_until(self, predicate):
         for r in self.responses:
             if predicate(r):
                 return r
 
-        await self.received.lock()
+        await self.received.acquire()
         try:
             while True:
-                if await self.received.wait_for(lambda: predicate(self.responses[-1])):
-                    return self.responses[-1]
+                await self.received.wait()
+                resp = self.responses[-1]
+                if predicate(resp):
+                    self.response = resp
+                    return resp
         finally:
             self.received.release()
 
     # called by the port when a message is matched to
     # this request
-    async def process(msg):
-        await self.received.lock()
+    async def process(self, msg):
+        await self.received.acquire()
         try:
             self.responses.append(msg)
             self.received.notify_all()
@@ -131,6 +166,9 @@ class Port:
         self._write_handlers = []
         self._read_handlers = []
 
+        self._watch_write = lambda m: logger.info(f'wrote: {m}')
+        self._watch_read = lambda m: logger.info(f'read: {m}')
+
         # if using the start, stop api this will be set
         self._task = None
 
@@ -140,9 +178,28 @@ class Port:
         self._open_requests.clear()
         self._queue = asyncio.PriorityQueue() # clear the queue
 
-        self._task = self._run(conn)
+        self._task = loop.create_task(self._run(conn))
         return self._task
 
+    def notify_write(self, h):
+        self._write_handlers.append(h)
+
+    def notify_read(self, h):
+        self._read_handlers.append(h)
+
+    def stop_notify_write(self, h):
+        self._write_handlers.remove(h)
+
+    def stop_notify_read(self, h):
+        self._read_handlers.remove(h)
+
+    def start_watching(self):
+        self.notify_write(self._watch_write)
+        self.notify_read(self._watch_read)
+
+    def stop_watching(self):
+        self.stop_notify_write(self._watch_write)
+        self.stop_notify_read(self._watch_read)
 
     def stop(self):
         if self._task:
@@ -156,13 +213,14 @@ class Port:
         self._queue.put_nowait((priority, req))
         return req
 
-    def _run(self, conn):
-        return asyncio.gather(self._run_writer(conn), self._run_reader(conn))
+    async def _run(self, conn):
+        co = {self._run_writer(conn), self._run_reader(conn)}
+        await asyncio.wait(co, return_when=asyncio.FIRST_COMPLETED)
 
     async def _run_writer(self, conn):
         try:
             while True:
-                req = await self._queue.get()
+                pri, req = await self._queue.get()
                 
                 # Put a weak reference to the request in the open requests list
                 self._open_requests.append(weakref.ref(req))
@@ -174,7 +232,8 @@ class Port:
                     req.failure.clear()
 
                     # do the writing... (synchronously?)
-                    await self._conn.write(req.message)
+                    await conn.write(req.message.bytes)
+                    await conn.flush()
 
                     # set that the request has been written
                     req.written.set()
@@ -187,9 +246,10 @@ class Port:
                     try:
                         # wait for either the continue event to trigger
                         # or the resend condition
-                        await asyncio.wait_for(
-                                asyncio.wait(req.successful.wait(), 
-                                        req.failure.wait(), asyncio.FIRST_COMPLETED), req.timeout)
+                        waitables = {req.successful.wait(), req.failure.wait()}
+                        await asyncio.wait_for(asyncio.wait(waitables, 
+                                                return_when=asyncio.FIRST_COMPLETED), 
+                                            req.timeout)
                         if self.successful.is_set():
                             break
                     except asyncio.TimeoutError:
@@ -198,8 +258,12 @@ class Port:
 
                 # Wait for the mandatory quiet time after the request
                 await asyncio.sleep(req.quiet_time)
+        except EOFError:
+            pass
+        except:
+            traceback.print_exc()
         finally:
-            logger.info('shutting down writer')
+            logger.trace('writer exited')
 
     async def _run_reader(self, conn):
         decoder = message.MsgDecoder(self.defs)
@@ -207,7 +271,7 @@ class Port:
         try:
             while True:
                 try:
-                    await self._conn.read(1)
+                    buf = await conn.read(1)
                     msg = decoder.decode(buf)
                     if not msg:
                         continue
@@ -223,11 +287,11 @@ class Port:
                     if not req:
                         self._open_requests.remove(ref)
                     else:
-                        req.process(msg)
+                        await req.process(msg)
 
                 # notify all the handlers
                 handlers = list(self._read_handlers)
                 for h in handlers:
                     h(msg)
         finally:
-            logger.info('shutting down reader')
+            logger.trace('reader exited')

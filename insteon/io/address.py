@@ -28,6 +28,9 @@ class Address:
     def __str__(self):
         return self.human
 
+    def __repr__(self):
+        return self.human
+
     def __eq__(self, other):
         return self._hi == other._hi and self._mid == other._mid and self._low == other._low
 

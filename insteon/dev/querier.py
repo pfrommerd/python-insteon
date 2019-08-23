@@ -1,4 +1,4 @@
-from ..util import Channel,InsteonError, calc_simple_crc, calc_long_crc
+from ..util import InsteonError, calc_simple_crc, calc_long_crc
 from ..io.message import MsgType
 
 class Querier:

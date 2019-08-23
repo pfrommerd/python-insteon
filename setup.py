@@ -38,7 +38,7 @@ setup(
     keywords='insteon',  # Optional
     packages=find_packages(exclude=['contrib', 'docs', 'tests', 'deploy', 'target']),  # Required
 
-    install_requires=['pyserial','logbook','setuptools'],  # Optional
+    install_requires=['aioserial','logbook','setuptools'],  # Optional
     extras_require = {  # Optional
         'dev': [],
         'test': []
