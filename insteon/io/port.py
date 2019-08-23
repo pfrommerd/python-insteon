@@ -1,8 +1,5 @@
-import threading
-import traceback
-import queue
-import copy
 import weakref
+import asyncio
 
 import time
 
@@ -12,316 +9,225 @@ from .. import util as util
 import logbook
 logger = logbook.Logger(__name__)
 
-class WriteRequest:
-    def __init__(self, msg, priority=1, prewrite_quiet_time=0, postwrite_quiet_time=0,
-            write_channel=None, first_reply_channel=None,
-            ack_reply_channel=None, custom_channels=[], weakref_customs=True):
-        self.msg = msg
-        self.priority = priority
+"""
+To use a request you must first enter an
+await with request:
+    block
+and then you can use the various wait() calls
+"""
+class Request:
+    def __init__(self, msg, retries=5, timeout=0.1, quiet=0.1):
+        self.message = msg
+        self.tries = 0
+        self.remaining = retries
+        self.timeout = timeout
+        self.quiet_time = quiet
 
-        self.prewrite_quiet_time = prewrite_quiet_time
-        self.postwrite_quiet_time = postwrite_quiet_time
+        # on self.written being set the requester knows
+        # that the message has been written
+        self.written = asyncio.Event()
 
-        self.write_channel = write_channel 
+        # on self.continue being set the writer loop
+        # will move the next request
+        self.successful = asyncio.Event() 
 
-        self.first_reply_channel = first_reply_channel
+        # trigger this on a nack response
+        # or to manually request another resend 
+        # also (manually bump up remaining if necessary)
+        self.failure = asyncio.Event()
 
-        ack_msg_name = msg.type + 'Reply'
+        # lifetime of the request
+        self.done = asyncio.Event() 
 
-        # We must have this channel to know if we have received an ack!
-        self.ack_reply_channel = ack_reply_channel if ack_reply_channel else \
-                util.Channel(lambda x: x.type == ack_msg_name, 1)
+        # Notify when a message comes in
+        self.received = asyncio.Condition()
 
-        if not self.ack_reply_channel.has_filter or self.ack_reply_channel.has_activated:
-            # No filter or if we are reusing a channel
-            self.ack_reply_channel.reset_num_sent()
-            self.ack_reply_channel.set_filter(lambda x: x.type == ack_msg_name)
+        # A list of all the responses this message has received
+        self.responses = []
 
-        self.custom_channels = custom_channels # Will be added with write() call
-        self.weakref_customs = weakref_customs
 
-    def __gt__(self, other):
-        return self.priority > other.priority
-    def __lt__(self, other):
-        return self.priority < other.priority
-    def __ge__(self, other):
-        return self.priority >= other.priority
-    def __le__(self, other):
-        return self.priority <= other.priority
-    def __eq__(self, other):
-        return self.priority == other.priority
-    def __nq__(self, other):
-        return self.priority != other.priority
-
-# Takes a connection object that has read(), write(), flush(), and close() methods
-class Port:
-    def __init__(self, conn=None, definitions={}):
-        self.defs = definitions
-
-        # Connection and threads
-        self._conn = None
-        self._reader = None
-        self._writer = None
-
-        # A queue containing write requests
-        self._write_queue = queue.PriorityQueue()
-
-        # Setup the listeners
-        self._read_listeners = []
-        self._read_listeners_lock = threading.RLock()
-
-        self._write_listeners = []
-        self._write_listeners_lock = threading.RLock()
-
-        # Setup the watchers, for optional use by the user
-        # to print out to stdout the traffic through the port
-        self._read_watcher = lambda x: print(str(x))
-        self._write_watcher = lambda x: print(str(x))
-
-        if conn:
-            self.attach(conn)
+    # ------------- Lifetime Management Functions --------------
 
     def __del__(self):
-        self.detach()
+        # set this for sure when the object is deleted
+        # so we don't have a leak
+        self.done.set()
 
-    def attach(self, conn):
-        if self._conn:
-            self.detach()
+    def __enter__(self):
+        pass
 
-        # Start threads
-        self._conn = conn
-        self._reader = threading.Thread(target=self._read_thread, daemon=True)
-        self._writer = threading.Thread(target=self._write_thread, daemon=True)
+    def __exit__(self):
+        self.done.set()
 
-        # Trigger for a thread to stop
-        self._reader.stop = self.close
-        self._writer.stop = self.close
+    def success(self):
+        self.successful.set()
 
-        self._reader.start()
-        self._writer.start()
+    # on failure, add some extra quiet time
+    # note: currently this is only applied after all
+    # tries fall through, we should make this a per-resend quiet_time
+    def fail(self, extra_quiet=0):
+        self.failure.set()
 
-    def detach(self):
-        if self._reader:
-            r = self._reader
-            self._reader = None
-            r.join()
-        if self._writer:
-            w = self._writer
-            self._writer = None
-            w.join()
+    # ---------------- Response Management Functions ------------
 
-        self._conn = None
+    # when consume() is called a message
+    # gets eaten so it won't trigger wait anymore
+    def consume(msg):
+        self.responses.remove(msg)
 
-    def close(self): # Detaches and closes the connection
-        if self._conn:
-            conn = self._conn
-            self.detach()
-            conn.close()
+    # will eat upto a particular message
+    def consume_until(msg):
+        for i in range(len(responses)):
+            if responses[i] == msg:
+                self.responses = self.responses[i + 1:]
 
-    def notify_on_read(self, handler):
-        if not handler:
-            return
-        with self._read_listeners_lock:
-            self._read_listeners.append(handler)
 
-    def unregister_on_read(self, handler):
-        if not handler:
-            return
-        with self._read_listeners_lock:
-            if handler in self._read_listeners:
-                self._read_listeners.remove(handler)
+    # The underlying wait functions
+    # are wrapped above to have timeouts
+    async def _wait():
+        if len(self.responses) > 0:
+            return self.responses[0]
 
-    def notify_on_write(self, handler):
-        if not handler:
-            return
-        with self._write_listeners_lock:
-            self._write_listeners.append(handler)
+        await self.received.lock()
+        try:
+            await self.received.wait()
+            return self.responses[0]
+        finally:
+            self.received.release()
 
-    def unregister_on_write(self, handler):
-        if not handler:
-            return
-        with self._write_listeners_lock:
-            if handler in self._write_listeners:
-                self._write_listeners.remove(handler)
+    async def _wait_util(predicate):
+        for r in self.responses:
+            if predicate(r):
+                return r
 
-    # Utility debug functions.....
+        await self.received.lock()
+        try:
+            while True:
+                if await self.received.wait_for(lambda: predicate(self.responses[-1])):
+                    return self.responses[-1]
+        finally:
+            self.received.release()
 
-    def start_watching(self):
-        self.notify_on_read(self._read_watcher)
-        self.notify_on_write(self._write_watcher)
-    
-    def stop_watching(self):
-        self.unregister_on_read(self._read_watcher)
-        self.unregister_on_write(self._write_watcher)
+    # called by the port when a message is matched to
+    # this request
+    async def process(msg):
+        await self.received.lock()
+        try:
+            self.responses.append(msg)
+            self.received.notify_all()
+        finally:
+            self.received.release()
 
-    # Now the actual IO logic
-    # added as weak references, so they won't stay
-    # around if the channel goes out of scope by the original caller
-    def write(self, msg, priority=1, prewrite_quiet_time=0, postwrite_quiet_time = 0,
-            write_channel=None, first_reply_channel=None,
-            ack_reply_channel=None, custom_channels=[], weakref_customs=True):
+class Port:
+    def __init__(self, definitions={}):
+        self.defs = definitions
 
-        self.write_request( WriteRequest(msg, priority,
-            prewrite_quiet_time, postwrite_quiet_time,
-            write_channel, first_reply_channel,
-            ack_reply_channel, custom_channels, weakref_customs) )
+        self._queue = asyncio.PriorityQueue()
 
-    def write_request(self, request):
-        self._write_queue.put(request)
+        # Requests that aren't done yet
+        # there can be multiple running concurrently at any given time
+        self._open_requests = []
 
-    def _read_thread(self):
+        self._write_handlers = []
+        self._read_handlers = []
+
+        # if using the start, stop api this will be set
+        self._task = None
+
+    def start(self, conn, loop=None):
+        if not loop:
+            loop = asyncio.get_event_loop()
+        self._open_requests.clear()
+        self._queue = asyncio.PriorityQueue() # clear the queue
+
+        self._task = self._run(conn)
+        return self._task
+
+
+    def stop(self):
+        if self._task:
+            self._task.cancel()
+        self._task = None
+
+    """ Write returns a request object through which the 
+        caller can get access to a queue containing all future messages that have been sent """
+    def write(self, msg, priority=1, retries=5, timeout=0.1, quiet=0.1):
+        req = Request(msg, retries, timeout, quiet)
+        self._queue.put_nowait((priority, req))
+        return req
+
+    def _run(self, conn):
+        return asyncio.gather(self._run_writer(conn), self._run_reader(conn))
+
+    async def _run_writer(self, conn):
+        try:
+            while True:
+                req = await self._queue.get()
+                
+                # Put a weak reference to the request in the open requests list
+                self._open_requests.append(weakref.ref(req))
+
+                # Do the writing
+                for try_num in range(req.remaining):
+                    # bump tries and clear failure flag
+                    req.tries = try_num + 1
+                    req.failure.clear()
+
+                    # do the writing... (synchronously?)
+                    await self._conn.write(req.message)
+
+                    # set that the request has been written
+                    req.written.set()
+
+                    # notify the handlers that it has been written
+                    handlers = list(self._write_handlers)
+                    for h in handlers:
+                        h(req.message)
+
+                    try:
+                        # wait for either the continue event to trigger
+                        # or the resend condition
+                        await asyncio.wait_for(
+                                asyncio.wait(req.successful.wait(), 
+                                        req.failure.wait(), asyncio.FIRST_COMPLETED), req.timeout)
+                        if self.successful.is_set():
+                            break
+                    except asyncio.TimeoutError:
+                        # We timed out so set the failure flag ourselves
+                        req.failure.set()
+
+                # Wait for the mandatory quiet time after the request
+                await asyncio.sleep(req.quiet_time)
+        finally:
+            logger.info('shutting down writer')
+
+    async def _run_reader(self, conn):
         decoder = message.MsgDecoder(self.defs)
         buf = bytes()
-        while self._reader and self._conn.is_open:
-            try:
-                buf = self._conn.read(1) # Read a byte
-                # Feed into decoder
-                msg = decoder.decode(buf)
-                if not msg:
+        try:
+            while True:
+                try:
+                    await self._conn.read(1)
+                    msg = decoder.decode(buf)
+                    if not msg:
+                        continue
+                except TypeError as te:
                     continue
-            except TypeError as te: # Gets thrown on close() called during read() sometimes
-                continue
-            except Exception as e:
-                logger.error(str(e))
-                continue
-            
-            # Notify listeners
-            with self._read_listeners_lock:
-                listeners = list(self._read_listeners)
-                for lr in listeners:
-                    if isinstance(lr, weakref.ref):
-                        l = lr()
-                        if not l:
-                            self._read_listeners.remove(lr)
-                            continue
+                except Exception as e:
+                    logger.error(str(e))
+                    continue
+
+                # notify all the open requests
+                for ref in self._open_requests:
+                    req = ref()
+                    if not req:
+                        self._open_requests.remove(ref)
                     else:
-                        l = lr
-                    l(msg)
+                        req.process(msg)
 
-    def _write_thread(self):
-        while self._writer and self._conn.is_open:
-            try:
-                request = self._write_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-
-            # Wait the pre-write quiet time we want
-            # during this time all is quiet
-            if request.prewrite_quiet_time > 0:
-                time.sleep(request.prewrite_quiet_time)
-
-            msg = request.msg
-
-            # Callback channels to notify on write/read:
-            write_channel = request.write_channel
-            first_reply_channel = request.first_reply_channel
-            ack_reply_channel = request.ack_reply_channel
-
-            if write_channel:
-                write_channel.set_queuesize(1)
-                write_channel.set_filter(None)
-
-            if first_reply_channel:
-                first_reply_channel.set_filter(None)
-
-            # Our channels for writer control
-            any_reply_channel = util.Channel() # For writer control
-            any_reply_channel.set_filter(None) # Let everything in
-
-            nack_reply_channel = util.Channel() # For writer control
-            nack_reply_channel.set_filter(lambda msg: msg.type == 'PureNACK')
-
-            # Get the listener lock so we don't miss anything
-            # while we write
-            with self._read_listeners_lock:
-                # Add the channels
-                self.notify_on_read(any_reply_channel)
-                self.notify_on_read(nack_reply_channel)
-
-                self.notify_on_read(first_reply_channel)
-                self.notify_on_read(ack_reply_channel)
-
-                self.notify_on_write(write_channel)
-
-                # Will be removed by hand by the person who
-                # queued the write if weakref_customs is False
-                # otherwise will be automatically removed
-                for channel in request.custom_channels:
-                    if request.weakref_customs:
-                        self.notify_on_read(weakref.ref(channel))
-                    else:
-                        self.notify_on_read(channel)
-
-                for i in range(5): # Maximum of 5 resends...
-
-                    # Now we do the actual writing
-                    try: 
-                        data = msg.bytes
-                        self._conn.write(data)
-                        self._conn.flush()
-                    except Exception as e:
-                        # TODO: Make logging
-                        logger.error(str(e))
-                        break # Move on to the next message
-
-                    # Notify the listeners of the write
-                    with self._write_listeners_lock:
-                        listeners = list(self._write_listeners)
-                        for lr in listeners:
-                            if isinstance(lr, weakref.ref):
-                                l = lr()
-                                if not l:
-                                    self._write_listeners.remove(lr)
-                                    continue
-                            else:
-                                l = lr
-                            l(msg)
-
-                    # Remove the write channel the first time we write
-                    if i == 0:
-                        self.unregister_on_write(write_channel)
-
-                    # Now we see what comes back by disabling the listener lock
-                    self._read_listeners_lock.release()
-
-                    resend = False
-                    for mi in range(6): # Look at the next 6 messages or 0.6 second, max
-                        if any_reply_channel.wait(0.1): # Wait 100ms for something to arrive
-                            # Check if what came was an ack or nack
-                            if ack_reply_channel.has_activated:
-                                # Woo, we are done, no resend
-                                break
-                            elif nack_reply_channel.has_activated:
-                                # Resend on a nack
-                                any_reply_channel.clear()
-                                nack_reply_channel.clear()
-                                resend = True
-                                break
-                            else:
-                                # Other message type...wait again
-                                any_reply_channel.clear()
-
-                    if not ack_reply_channel.has_activated and not resend:
-                        # Resend due to no ack!
-                        any_reply_channel.clear()
-                        nack_reply_channel.clear()
-                        resend = True
-
-                    # Re-acquire so the with block doesn't get confused
-                    self._read_listeners_lock.acquire() 
-
-                    if not resend:
-                        break
-
-                # Remove the listeners
-                self.unregister_on_read(first_reply_channel)
-                self.unregister_on_read(ack_reply_channel)
-                self.unregister_on_read(any_reply_channel)
-                self.unregister_on_read(nack_reply_channel)
-
-                # In case this hasn't happened
-                self.unregister_on_write(write_channel)
-            # Now outside of the lock,
-            # post-write quiet time
-            if request.postwrite_quiet_time > 0:
-                time.sleep(request.postwrite_quiet_time)
+                # notify all the handlers
+                handlers = list(self._read_handlers)
+                for h in handlers:
+                    h(msg)
+        finally:
+            logger.info('shutting down reader')
