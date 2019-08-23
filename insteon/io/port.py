@@ -100,6 +100,7 @@ class Request:
             else:
                 return self._wait_until(predicate)
         except asyncio.TimeoutError:
+            print('timed out')
             self.response = None
             return None
 
@@ -201,9 +202,13 @@ class Port:
         self.stop_notify_write(self._watch_write)
         self.stop_notify_read(self._watch_read)
 
-    def stop(self):
+    async def stop(self):
         if self._task:
             self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
         self._task = None
 
     """ Write returns a request object through which the 
@@ -214,8 +219,12 @@ class Port:
         return req
 
     async def _run(self, conn):
-        co = {self._run_writer(conn), self._run_reader(conn)}
-        await asyncio.wait(co, return_when=asyncio.FIRST_COMPLETED)
+        try:
+            await asyncio.gather(self._run_writer(conn), self._run_reader(conn))
+        except asyncio.CancelledError:
+            raise
+        finally:
+            pass
 
     async def _run_writer(self, conn):
         try:
@@ -247,11 +256,17 @@ class Port:
                         # wait for either the continue event to trigger
                         # or the resend condition
                         waitables = {req.successful.wait(), req.failure.wait()}
-                        await asyncio.wait_for(asyncio.wait(waitables, 
-                                                return_when=asyncio.FIRST_COMPLETED), 
-                                            req.timeout)
-                        if self.successful.is_set():
+                        _, pending = await asyncio.wait_for(asyncio.wait(waitables, 
+                                                        return_when=asyncio.FIRST_COMPLETED), 
+                                                        req.timeout)
+                        # cancel any pending waits
+                        for w in pending:
+                            w.cancel()
+
+                        if req.successful.is_set():
                             break
+                    except asyncio.CancelledError:
+                        raise
                     except asyncio.TimeoutError:
                         # We timed out so set the failure flag ourselves
                         req.failure.set()
@@ -260,10 +275,8 @@ class Port:
                 await asyncio.sleep(req.quiet_time)
         except EOFError:
             pass
-        except:
-            traceback.print_exc()
         finally:
-            logger.trace('writer exited')
+            pass
 
     async def _run_reader(self, conn):
         decoder = message.MsgDecoder(self.defs)
@@ -272,11 +285,17 @@ class Port:
             while True:
                 try:
                     buf = await conn.read(1)
+                    if buf is None:
+                        raise EOFError()
                     msg = decoder.decode(buf)
                     if not msg:
                         continue
-                except TypeError as te:
-                    continue
+                except asyncio.CancelledError:
+                    raise
+                except TypeError:
+                    raise
+                except EOFError:
+                    raise
                 except Exception as e:
                     logger.error(str(e))
                     continue
@@ -293,5 +312,11 @@ class Port:
                 handlers = list(self._read_handlers)
                 for h in handlers:
                     h(msg)
+        except EOFError:
+            pass
+        except asyncio.CancelledError:
+            raise
+        except:
+            traceback.print_exc()
         finally:
-            logger.trace('reader exited')
+            pass

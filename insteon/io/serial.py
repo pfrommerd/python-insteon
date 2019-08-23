@@ -1,7 +1,10 @@
 import logbook
 logger = logbook.Logger(__name__)
 
+import traceback
+
 from ..util import InsteonError
+
 
 class SerialConn:
     FIVEBITS, SIXBITS, SEVENBITS, EIGHTBITS = 5, 6, 7, 8
@@ -15,22 +18,30 @@ class SerialConn:
         self._name = port
         self._port = None
         try:
-            # Find the right serial implementation to use
             import aioserial
-            self._port = aioserial.AioSerial(port=port, baudrate=baudrate,
-                                        bytesize=bytesize, parity=parity,
-                                        stopbits=stopbits, timeout=timeout,
-                                        xonxoff=xonxoff, rtscts=rtscts,
-                                        write_timeout=write_timeout, dsrdtr=dsrdtr,
-                                        inter_byte_timeout=inter_byte_timeout)
+            import sys
+
+            ports = {}
+            if 'insteonterminal' in sys.modules:
+                if not hasattr(sys.modules['insteonterminal'], 'ports__'):
+                    sys.modules['insteonterminal'].ports__ = ports
+                else:
+                    ports = sys.modules['insteonterminal'].ports__
+
+            if port in ports:
+                self._port = ports[port]._port
+            else:
+                self._port = aioserial.AioSerial(port=port, baudrate=baudrate,
+                                            bytesize=bytesize, parity=parity,
+                                            stopbits=stopbits, timeout=timeout,
+                                            xonxoff=xonxoff, rtscts=rtscts,
+                                            write_timeout=write_timeout, dsrdtr=dsrdtr,
+                                            inter_byte_timeout=inter_byte_timeout)
+            ports[port] = self
         except Exception as e:
             raise InsteonError('Could not open serial port {}, bd: {}, bs: {}, parity: {}, stopbits: {}'.format(
                                 port, baudrate, bytesize, parity, stopbits))
 
-
-    def __del__(self):
-        if self.is_open:
-            self.close()
     
     @property
     def is_open(self):
@@ -39,6 +50,8 @@ class SerialConn:
         return self._port.is_open
 
     def close(self):
+        print('closing')
+        traceback.print_stack()
         try:
             if not self.is_open:
                 return
@@ -49,10 +62,10 @@ class SerialConn:
     async def read(self, size=1):
         try:
             if not self.is_open:
-                return
+                return 
             return await self._port.read_async(size)
         except Exception as e:
-            raise e
+            raise EOFError()
             #self.close()
             #raise InsteonError('Error reading from serial port {}'.format(self._name))
 
@@ -61,11 +74,9 @@ class SerialConn:
             if not self.is_open:
                 return
             return await self._port.write_async(data)
-        except AssertionError as e:
-            self.close()
+        except AssertionError:
             raise EOFError()
-        except Exception as e:
-            self.close()
+        except Exception:
             raise InsteonError('Error writing to serial port {}'.format(self._name))
 
     async def flush(self):
