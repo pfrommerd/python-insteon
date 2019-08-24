@@ -17,23 +17,23 @@ class DBManager:
 
     # Will update/return the target db,
     # create a new database if None
-    def update_cache(self, targetdb=None, allow_linking=False, port=None):
+    async def update_cache(self, targetdb=None, allow_linking=False, port=None):
         port = port if port else self._dev.port
 
         if not targetdb:
             targetdb = self.cache
 
         # _retrieve() returns a LinkDB() object
-        records = self._retrieve(port)
+        records = await self._retrieve(port)
         # check if based on the retrieved
         # records we would have the permissions
         # to get a proper db
         if not self._check_permissions(records):
-            if not self._grant_permissions(allow_linking):
+            if not await self._grant_permissions(allow_linking):
                 logger.error('Not linked as a controller so cannot retrieve database. Use allow_linking to auto-link the modem as a controller of this device')
                 raise InsteonError('Not linked as a controller so cannot access database')
             # Get a fresh copy now that we have permissions
-            records = self._retrieve(port)
+            records = await self._retrieve(port)
             if not self._check_permissions(records):
                 raise InsteonError('Failed to get permission to modify the database')
 
@@ -41,7 +41,7 @@ class DBManager:
 
         return targetdb
 
-    def flash_cache(self, srcdb=None, allow_linking=False, port=None):
+    async def flash_cache(self, srcdb=None, allow_linking=False, port=None):
         port = port if port else self._dev.port
 
         if not srcdb:
@@ -57,7 +57,7 @@ class DBManager:
         currentdb = linkdb.LinkDB()
         # Make a backup ....
         # Retrieve the current DB into a "currentdb" variable
-        self.update_cache(targetdb=currentdb, allow_linking=allow_linking, port=port)
+        await self.update_cache(targetdb=currentdb, allow_linking=allow_linking, port=port)
 
         # Save the currentdb
         backfile_name = '{}.linkdb.bk'.format(datetime.datetime.now().strftime('%b_%d_%Y_%H:%M:%S'))
@@ -66,7 +66,7 @@ class DBManager:
         currentdb.save(backfile_name)
 
         logger.trace('Writing linkdb changes')
-        self._write(port, srcdb, currentdb)
+        await self._write(port, srcdb, currentdb)
 
     # Checks if the db has the permissions for
     # us to read
@@ -81,13 +81,13 @@ class DBManager:
     # The actual implementation
     # that returns a database
     # retrieved
-    def _retrieve(self, port):
+    async def _retrieve(self, port):
         pass
 
     # The actual implementation that writes
     # a database given a current database and
     # a source database to write
-    def _write(self, port, srcdb, currentdb):
+    async def _write(self, port, srcdb, currentdb):
         pass
 
 
@@ -287,41 +287,27 @@ class ModemDBManager(DBManager):
     def __init__(self, dev):
         super().__init__(dev)
 
-    def _retrieve(self, port):
-        reply_channel = Channel()
-        done_channel = Channel(lambda x: (x.type == 'GetFirstALLLinkRecordReply' or \
-                                              x.type == 'GetNextALLLinkRecordReply') and \
-                                              x['ACK/NACK'] == 0x15)
-        record_channel = Channel(lambda x: x.type == 'ALLLinkRecordResponse')
-
-
-        # Now send the first message
-        port.write(port.defs['GetFirstALLLinkRecord'].create(), ack_reply_channel=reply_channel,
-                        custom_channels=[done_channel, record_channel])
-        # Custom channels will be removed on garbage collect due to
-        # weak references
-
+    async def _retrieve(self, port):
         records = []
+        first = True
+        while True:
+            msg_type = 'GetFirstALLLinkRecord' if first else 'GetNextALLLinkRecord'
+            first = False
 
-        while reply_channel.recv(5): # Wait at most 5 seconds for some reply
-            if done_channel.has_activated: # If the reply says we are done, exit
-                break
-            # Wait another 2 seconds for the record
-            msg = record_channel.recv(2)
-            if not msg:
-                raise InsteonError('No link data after ack for modem DB query')
+            with port.write(port.defs[msg_type].create()) as req:
+                res = await req.wait_success_fail(timeout=5)
+                req.consume(res)
+                if not res:
+                    raise InsteonError('Did not get reply for modem DB query')
+                if res['ACK/NACK'] == 0x15:
+                    break # Hit the end
+                msg = await req.wait_until(lambda m: m.type == 'ALLLinkRecordResponse', timeout=2)
+                req.consume(msg)
 
-            # Turn the msg into a record
-            rec = linkdb.LinkRecord(None, msg['LinkAddr'], msg['ALLLinkGroup'],
-                                    msg['RecordFlags'],
-                                    [msg['LinkData1'], msg['LinkData2'], msg['LinkData3']])
-            records.append(rec)
-
-            # Request the next one
-            port.write(port.defs['GetNextALLLinkRecord'].create(),
-                        ack_reply_channel=reply_channel)
-        else:
-            raise InsteonError('Did not get reply for modem DB query')
+                rec = linkdb.LinkRecord(None, msg['LinkAddr'], msg['ALLLinkGroup'],
+                                        msg['RecordFlags'],
+                                        [msg['LinkData1'], msg['LinkData2'], msg['LinkData3']])
+                records.append(rec)
         
         db = linkdb.LinkDB()
         db.update(records)

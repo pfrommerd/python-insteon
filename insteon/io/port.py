@@ -75,7 +75,8 @@ class Request:
     # when consume() is called a message
     # gets eaten so it won't trigger wait anymore
     def consume(self, msg):
-        self.responses.remove(msg)
+        if msg:
+            self.responses.remove(msg)
 
     # will eat upto a particular message
     def consume_until(self, msg):
@@ -104,7 +105,11 @@ class Request:
             self.response = None
             return None
 
-    def wait_success_fail(self, success_type, timeout=0):
+    async def wait_success_fail(self, success_type=None, timeout=0):
+        # default success type
+        if not success_type:
+            success_type = self.message.type + 'Reply'
+
         def handle(msg):
             if msg.type == 'PureNACK':
                 self.failure.set()
@@ -112,7 +117,8 @@ class Request:
                 self.successful.set()
                 return True
             return False 
-        return self.wait_until(handle, timeout)
+        await self.written.wait()
+        return await self.wait_until(handle, timeout)
 
     # The underlying wait functions
     # are wrapped above to have timeouts
